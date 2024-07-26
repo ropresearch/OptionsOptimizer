@@ -141,8 +141,17 @@ Option = namedtuple('Option', ['symbol', 'type', 'strike', 'price', 'delta', 'ga
 Option.__new__.__defaults__ = (None,) * len(Option._fields)
 
 class OptionsStrategyAnalyzer:
-    def __init__(self, options_data):
-        self.options_data = [Option(**{k: v for k, v in option.items() if k in Option._fields}) for option in options_data]
+    def __init__(self, options_data, min_option_price=0.05):
+        self.min_option_price = min_option_price
+        self.options_data = [
+            Option(**{k: v for k, v in option.items() if k in Option._fields})
+            for option in options_data
+            if option['price'] >= self.min_option_price
+        ]
+        print(f"Filtered options data: {len(self.options_data)} options remaining after applying minimum price filter of ${self.min_option_price:.2f}")
+    
+    def calculate_score(self, strategy, metrics):
+        return sum(strategy[f'net_{metric}'] for metric in metrics)
     
     def calculate_credit_debit(self, legs):
         return sum(-leg['direction'] * leg['option'].price for leg in legs)
@@ -159,22 +168,39 @@ class OptionsStrategyAnalyzer:
                 for direction in itertools.product([1, -1], repeat=n):
                     legs = [{"option": leg, "direction": d} for leg, d in zip(combo, direction)]
                     strategy_id = self.create_strategy_identifier(legs)
-
+                    
                     if strategy_id not in strategies:
                         strategy_type = self.identify_strategy(legs)
-                        max_loss, max_profit = self.calculate_max_loss_profit(legs, strategy_type)
-                        credit_debit = self.calculate_credit_debit(legs)
-                        strategy = {
-                            'legs': legs,
-                            'strategy_type': strategy_type,
-                            'max_loss': max_loss,
-                            'max_profit': max_profit,
-                            'credit_debit': credit_debit,
-                            'net_gamma': sum(leg['direction'] * leg['option'].gamma for leg in legs),
-                            'net_vega': sum(leg['direction'] * leg['option'].vega for leg in legs),
-                            'net_theta': sum(leg['direction'] * leg['option'].theta for leg in legs)
-                        }
+                        max_loss, max_profit, cost = self.calculate_max_loss_profit(legs, strategy_type)
+                        # credit_debit = self.calculate_credit_debit(legs)
+                        is_credit = cost > 0
+                        # logging.debug(f'Credit: {is_credit}, Cost: {cost}, Max Loss: {max_loss}, Max Profit: {max_profit}, Strategy: {strategy_type}, Legs: {legs}')
+                        if not is_credit:
+                            strategy = {
+                                'legs': legs,
+                                'strategy_type': strategy_type,
+                                'max_loss': max_loss,
+                                'max_profit': cost,
+                                'credit_debit': cost,
+                                'is_credit': is_credit,
+                                'net_gamma': sum(leg['direction'] * leg['option'].gamma for leg in legs),
+                                'net_vega': sum(leg['direction'] * leg['option'].vega for leg in legs),
+                                'net_theta': sum(leg['direction'] * leg['option'].theta for leg in legs)
+                            }
+                        else:
+                            strategy = {
+                                'legs': legs,
+                                'strategy_type': strategy_type,
+                                'max_loss': max_loss,
+                                'max_profit': max_profit,
+                                'credit_debit': cost,
+                                'is_credit': is_credit,
+                                'net_gamma': 0,
+                                'net_vega': 0,
+                                'net_theta': 0
+                            }
                         strategies[strategy_id] = strategy
+                        # logging.debug(f"Strategy: {strategy_type}, Is Credit: {is_credit}, Max Loss: {max_loss}, Max Profit: {max_profit}")
 
         return list(strategies.values())
 
@@ -194,17 +220,25 @@ class OptionsStrategyAnalyzer:
         return "Custom"
 
     def calculate_max_loss_profit(self, legs, strategy_type):
+        # if strategy_type in ["Long Call", "Long Put"]:
+        #     option = legs[0]['option']
+        #     max_loss = option.price
+        #     if strategy_type == "Long Call":
+        #         max_profit = float('inf')
+        #     else:  # Long Put
+        #         max_profit = max(0, option.strike - option.price)
+        cost = 0;
+
         if strategy_type in ["Long Call", "Long Put"]:
             option = legs[0]['option']
             max_loss = option.price
-            if strategy_type == "Long Call":
-                max_profit = float('inf')
-            else:  # Long Put
-                max_profit = option.strike - option.price
+            max_profit = float('inf')
+            cost = -option.price
 
         elif strategy_type in ["Short Call", "Short Put"]:
             option = legs[0]['option']
             max_profit = option.price
+            cost = max_profit
             if strategy_type == "Short Call":
                 max_loss = float('inf')
             else:  # Short Put
@@ -215,33 +249,44 @@ class OptionsStrategyAnalyzer:
             higher_strike_leg = max(legs, key=lambda x: x['option'].strike)
             width = higher_strike_leg['option'].strike - lower_strike_leg['option'].strike
 
+            if width > 20:  # Example sanity check, adjust as needed
+                logging.warning(f"Unusually large width for {strategy_type}: {width}")
+
             if strategy_type == "Call Vertical Spread":
                 if lower_strike_leg['direction'] == 1:  # Long lower strike, short higher strike (debit spread)
-                    debit = lower_strike_leg['option'].price - higher_strike_leg['option'].price
-                    max_profit = width - debit
-                    max_loss = debit
+                    debit = higher_strike_leg['option'].price - lower_strike_leg['option'].price
+                    max_profit = width + debit
+                    max_loss = abs(debit)
+                    cost = debit
                 else:  # Short lower strike, long higher strike (credit spread)
                     credit = lower_strike_leg['option'].price - higher_strike_leg['option'].price
                     max_profit = credit
                     max_loss = width - credit
+                    cost = credit
             else:  # Put Vertical Spread
-                if lower_strike_leg['direction'] == -1:  # Short lower strike, long higher strike (credit spread)
+                if lower_strike_leg['direction'] == -1:  # Short lower strike, long higher strike (Bear Put Spread)
+                    debit = lower_strike_leg['option'].price - higher_strike_leg['option'].price
+                    max_profit = width + debit
+                    max_loss = abs(debit)
+                    cost = debit
+                else:  # Long lower strike, short higher strike (Bull Put Spread)
                     credit = higher_strike_leg['option'].price - lower_strike_leg['option'].price
                     max_profit = credit
                     max_loss = width - credit
-                else:  # Long lower strike, short higher strike (debit spread)
-                    debit = higher_strike_leg['option'].price - lower_strike_leg['option'].price
-                    max_profit = width - debit
-                    max_loss = debit
+                    cost = credit
+
+            # logging.debug(f"{strategy_type}: Width: {width}, Cost: {cost}, Max Profit: {max_profit}, Max Loss: {max_loss}")
 
         elif strategy_type in ["Straddle", "Strangle"]:
             total_premium = sum(leg['option'].price for leg in legs)
             if legs[0]['direction'] == 1:  # Long straddle/strangle
                 max_loss = total_premium
                 max_profit = float('inf')
+                cost = -total_premium
             else:  # Short straddle/strangle
                 max_loss = float('inf')
                 max_profit = total_premium
+                cost = total_premium
 
         elif strategy_type == "Butterfly":
             middle_strike = sorted(set(leg['option'].strike for leg in legs))[1]
@@ -252,23 +297,26 @@ class OptionsStrategyAnalyzer:
                 debit = sum(leg['direction'] * leg['option'].price for leg in legs)
                 max_loss = debit
                 max_profit = width - debit
+                cost = debit
             else:  # Short butterfly
                 credit = -sum(leg['direction'] * leg['option'].price for leg in legs)
                 max_profit = credit
                 max_loss = width - credit
+                cost = credit
 
         elif strategy_type == "Iron Condor":
             strikes = sorted(set(leg['option'].strike for leg in legs))
             width = min(strikes[1] - strikes[0], strikes[3] - strikes[2])
             credit = sum(leg['direction'] * leg['option'].price for leg in legs)
+            cost = credit
             max_profit = credit
             max_loss = width - credit
 
         else:  # Custom strategy
-            # For custom strategies, we'll use a simplified approach
             total_debit = sum(max(0, leg['direction'] * leg['option'].price) for leg in legs)
             total_credit = sum(max(0, -leg['direction'] * leg['option'].price) for leg in legs)
-
+            
+            cost = total_debit + total_credit
             if total_debit > total_credit:  # Net debit strategy
                 max_loss = total_debit - total_credit
                 max_profit = float('inf')  # Assume unlimited profit potential for custom strategies
@@ -278,15 +326,14 @@ class OptionsStrategyAnalyzer:
 
         # Handle edge cases
         if max_loss == 0 and max_profit == 0:
-            # If both are zero, it's likely due to rounding errors or an invalid strategy
             max_loss = 0.01  # Set a small non-zero value
-        elif max_loss == 0:
-            # If max_loss is zero but max_profit isn't, it's a "risk-free" strategy
-            pass  # Keep max_loss as zero
-        
-        return max_loss, max_profit
+            print("Edge case: Both max_loss and max_profit were zero. Set max_loss to 0.01")
+
+        # logging.debug(f'Legs: {legs}, Strategy Type: {strategy_type}, Max Loss: {max_loss}, Max Profit: {max_profit}, Cost: {cost}')
+        return max_loss, max_profit, cost
 
     def filter_strategies(self, strategies, risk_profile):
+        
         if risk_profile == 'limited':
             return [s for s in strategies if self.is_limited_risk(s) and self.is_limited_profit(s)]
         elif risk_profile == 'unlimited':
@@ -301,28 +348,50 @@ class OptionsStrategyAnalyzer:
         return strategy['max_profit'] != float('inf')
 
     def optimize_strategies(self, strategies, metrics):
-        def score_strategy(strategy, metrics):
+        def score_strategy(strategy):
             return sum(strategy[f'net_{metric}'] for metric in metrics)
 
-        scored_strategies = [(strategy, score_strategy(strategy, metrics)) for strategy in strategies]
+        scored_strategies = [(strategy, score_strategy(strategy)) for strategy in strategies]
         return sorted(scored_strategies, key=lambda x: x[1], reverse=True)
 
     def filter_by_profit_loss_ratio(self, strategies, min_ratio):
-        return [
-            strategy for strategy in strategies
-            if (strategy['max_profit'] != float('inf') and 
-                strategy['max_loss'] != float('inf') and
-                strategy['max_loss'] != 0 and
-                (strategy['max_profit'] / strategy['max_loss']) >= min_ratio) or
-               (strategy['max_loss'] == 0 and strategy['max_profit'] > 0)
-        ]
+        filtered_strategies = []
+        for strategy in strategies:
+            max_loss = strategy['max_loss']
+            max_profit = strategy['max_profit']
+            if max_profit != float('inf') and max_loss != float('inf') and max_loss > 0:
+                ratio = max_profit / max_loss
+                if ratio >= min_ratio:
+                    filtered_strategies.append(strategy)
+        return filtered_strategies
+            
+            # print(f"Filtering strategies with min P/L ratio of {min_ratio}")
+            # print(f"Strategies before filter: {len(strategies)}")
+            # print(f"Strategies after filter: {len(filtered_strategies)}")
 
-    def analyze_strategies(self, max_legs=3, risk_profile='limited', min_profit_loss_ratio=0, metrics=['gamma', 'vega', 'theta']):
+
+    def analyze_strategies(self, max_legs=3, risk_profile='limited', min_profit_loss_ratio=2, metrics=['gamma', 'vega', 'theta']):
         all_strategies = self.create_strategies(max_legs)
-        filtered_strategies = self.filter_strategies(all_strategies, risk_profile)
-        ratio_filtered_strategies = self.filter_by_profit_loss_ratio(filtered_strategies, min_profit_loss_ratio)
-        return self.optimize_strategies(ratio_filtered_strategies, metrics)
+        print(f"Total strategies created: {len(all_strategies)}")
 
+        filtered_strategies = self.filter_strategies(all_strategies, risk_profile)
+        print(f"Strategies after risk profile filter: {len(filtered_strategies)}")
+
+        # # Then filter by profit/loss ratio
+        # ratio_filtered_strategies = self.filter_by_profit_loss_ratio([strategy for strategy, _ in optimized_strategies], min_profit_loss_ratio)
+        # print(f"Strategies after profit/loss ratio filter: {len(ratio_filtered_strategies)}")
+      
+        # Optimize strategies based on metrics first
+        # Optimize strategies based on metrics
+        optimized_strategies = self.optimize_strategies(filtered_strategies, metrics)
+        print(f"Optimized strategies: {len(optimized_strategies)}")
+
+        final_strategies = [(strategy, score) for strategy, score in optimized_strategies]
+        final_strategies.sort(key=lambda x: x[1], reverse=True)
+
+        print(f"Final strategies: {len(final_strategies)}")
+
+        return final_strategies
 # def analyze_chunk(chunk, metrics, risk_profile):
 #     analyzer = OptionsStrategyAnalyzer(chunk)
 #     strategies = analyzer.create_strategies()
@@ -331,8 +400,8 @@ class OptionsStrategyAnalyzer:
 #     return optimized_strategies
 
 
-def analyze_chunk(chunk, max_legs, risk_profile, min_profit_loss_ratio, metrics):
-    analyzer = OptionsStrategyAnalyzer(chunk)
+def analyze_chunk(chunk, max_legs, risk_profile, min_profit_loss_ratio, metrics, min_option_price):
+    analyzer = OptionsStrategyAnalyzer(chunk, min_option_price=min_option_price)
     return analyzer.analyze_strategies(
         max_legs=max_legs,
         risk_profile=risk_profile,
@@ -353,6 +422,7 @@ def main():
     parser.add_argument('--top', type=int, default=10, help='Number of top strategies to return')
     parser.add_argument('--range', choices=['ITM', 'NTM', 'OTM', 'SAK', 'SBK', 'SNK', 'ALL'], default='ALL', help='Option range')
     parser.add_argument('--max_legs', type=int, default=3, help='Maximum number of legs in a strategy')
+    parser.add_argument('--min_option_price', type=float, default=0.05, help='Minimum price for options to consider')
     args = parser.parse_args()
 
     # Use the existing SchwabOptionsDataFetcher to get options data
@@ -371,23 +441,44 @@ def main():
                                   max_legs=args.max_legs,
                                   risk_profile=args.risk_profile,
                                   min_profit_loss_ratio=args.profit_loss_ratio,
-                                  metrics=args.metrics)
+                                  metrics=args.metrics,
+                                  min_option_price=args.min_option_price
+                                  )
         results = list(executor.map(partial_analyze, chunks))
 
     # Combine and sort results
     all_strategies = sorted([item for sublist in results for item in sublist], key=lambda x: x[1], reverse=True)
+    print(f"Total strategies after combining results: {len(all_strategies)}")
 
     # Prepare data for tabulate
     table_data = []
     for rank, (strategy, score) in enumerate(all_strategies[:args.top], 1):
+        max_loss = strategy['max_loss']
+        max_profit = strategy['max_profit']
+        strategy_type = strategy['strategy_type']
+        logging.debug(f"Final before switch loss, profit, strategy: {max_loss}, {max_profit}, {strategy_type}")
+        if strategy['is_credit'] and strategy['strategy_type'] not in ["Short Call", "Short Put"]:
+            max_loss, max_profit = max_profit, max_loss  # Swap for credit strategies   
+            logging.debug(f"Final after switch loss, profit, strategy: {max_loss}, {max_profit}, {strategy_type}")
+
+        # Calculate P/L ratio, handling division by zero
+        if max_loss == 0:
+            if max_profit > 0:
+                pl_ratio = "∞"  # Unicode infinity symbol
+            else:
+                pl_ratio = "N/A"
+        else:
+            pl_ratio = f"{max_profit / max_loss:.2f}"
+
         legs_str = "; ".join([f"{'Long' if leg['direction'] == 1 else 'Short'} {leg['option'].type.capitalize()} {leg['option'].strike}" for leg in strategy['legs']])
+
         table_data.append([
             rank,
             strategy['strategy_type'],
             legs_str,
-            f"${strategy['max_loss']:.2f}",
-            f"${strategy['max_profit']:.2f}",
-            f"{strategy['max_profit'] / strategy['max_loss']:.2f}",
+            f"${max_loss:.2f}",
+            f"${max_profit:.2f}",
+            pl_ratio,
             f"${strategy['credit_debit']:.2f} {'Credit' if strategy['credit_debit'] > 0 else 'Debit'}",
             *[f"{strategy[f'net_{metric}']:.6f}" for metric in args.metrics],
             f"{score:.6f}"
