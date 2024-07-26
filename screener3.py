@@ -79,7 +79,10 @@ class OptionsScreener:
         self.options = options_data[options_data['price'] >= min_option_price]
 
     def screen_single_leg_options(self, metrics, min_profit_loss_ratio=1):
-        self.options['profit_loss_ratio'] = self.options['max_profit'] / self.options['max_loss']
+        self.options['profit_loss_ratio'] = self.options.apply(
+            lambda row: row['max_profit'] / row['max_loss'] if row['max_loss'] != 0 else float('inf'), 
+            axis=1
+        )
         filtered_options = self.options[self.options['profit_loss_ratio'] >= min_profit_loss_ratio]
         
         filtered_options['score'] = filtered_options[metrics].abs().sum(axis=1)
@@ -95,12 +98,16 @@ class OptionsScreener:
         # Bull Call Spreads
         for (_, long), (_, short) in itertools.combinations(calls.iterrows(), 2):
             if long['strike'] < short['strike']:
-                spreads.append(self._create_spread(long, short, 'bull_call'))
+                spread = self._create_spread(long, short, 'bull_call')
+                if spread is not None:
+                    spreads.append(spread)
 
         # Bear Put Spreads
         for (_, long), (_, short) in itertools.combinations(puts.iterrows(), 2):
             if long['strike'] > short['strike']:
-                spreads.append(self._create_spread(long, short, 'bear_put'))
+                spread = self._create_spread(long, short, 'bear_put')
+                if spread is not None:
+                    spreads.append(spread)
 
         return pd.DataFrame(spreads)
 
@@ -121,6 +128,9 @@ class OptionsScreener:
             spread['max_profit'] = long['strike'] - short['strike'] - spread['net_debit']
             spread['max_loss'] = spread['net_debit']
 
+        if spread['max_loss'] <= 0:
+            return None  # Skip this spread as it's not valid
+
         spread['profit_loss_ratio'] = spread['max_profit'] / spread['max_loss']
 
         # Calculate net Greeks
@@ -131,8 +141,12 @@ class OptionsScreener:
 
     def screen_debit_spreads(self, metrics, min_profit_loss_ratio=1):
         spreads = self.generate_debit_spreads()
+        if spreads.empty:
+            return pd.DataFrame()  # Return an empty DataFrame if no valid spreads are found
         filtered_spreads = spreads[spreads['profit_loss_ratio'] >= min_profit_loss_ratio]
         
+        if filtered_spreads.empty:
+            return pd.DataFrame()  # Return an empty DataFrame if no spreads meet the criteria
         filtered_spreads['score'] = filtered_spreads[[f'net_{metric}' for metric in metrics]].abs().sum(axis=1)
         
         return filtered_spreads.sort_values('score', ascending=False)
